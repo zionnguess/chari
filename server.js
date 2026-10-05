@@ -11,7 +11,7 @@ const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 3000;
 const isProduction = process.env.NODE_ENV === 'production';
-const baseUrl = process.env.BASE_URL || (isProduction ? '' : `http://localhost:${PORT}`);
+const baseUrl = process.env.BASE_URL;
 if (isProduction ) throw new Error('BASE_URL doit être définie en production.');
 const BASE_URL = baseUrl.replace(/\/$/, '');
 const PAYTECH_URL = 'https://paytech.sn/api/payment/request-payment';
