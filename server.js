@@ -9,8 +9,11 @@ const fs = require('fs');
 const path = require('path');
 
 const app = express();
-const PORT = Number(process.env.PORT );
-const BASE_URL = (process.env.BASE_URL ).replace(/\/$/, '');
+const PORT = process.env.PORT || 3007;
+const isProduction = process.env.NODE_ENV === 'production';
+const baseUrl = process.env.BASE_URL || (isProduction ? '' : `http://localhost:${PORT}`);
+if (isProduction && !baseUrl) throw new Error('BASE_URL doit être définie en production.');
+const BASE_URL = baseUrl.replace(/\/$/, '');
 const PAYTECH_URL = 'https://paytech.sn/api/payment/request-payment';
 const PAYTECH_STATUS_URL = 'https://paytech.sn/api/payment/get-status';
 const DATA_FILE = path.join(__dirname, 'data', 'donations.json');
@@ -226,7 +229,7 @@ app.get('/paiement/annule', (req, res) => res.sendFile(path.join(__dirname, 'pub
 
 app.use((req, res) => res.status(404).sendFile(path.join(__dirname, 'public', '404.html')));
 
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n✓ Un Cartable, Un Avenir: ${BASE_URL}`);
   console.log(`✓ PayTech environment: ${process.env.PAYTECH_ENV || 'test'}`);
   console.log(`✓ API health: ${BASE_URL}/api/health\n`);
