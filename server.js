@@ -9,7 +9,7 @@ const fs = require('fs');
 const path = require('path');
 
 const app = express();
-const PORT = process.env.PORT || 3007;
+const PORT = process.env.PORT || 3000;
 const isProduction = process.env.NODE_ENV === 'production';
 const baseUrl = process.env.BASE_URL || (isProduction ? '' : `http://localhost:${PORT}`);
 if (isProduction && !baseUrl) throw new Error('BASE_URL doit être définie en production.');
