@@ -45,7 +45,7 @@ const app = express();
 
 const PORT = process.env.PORT || 3000;
 
-const isProduction = process.env.NODE_ENV === 'production';
+const isProduction = process.env.NODE_ENV === 'prod';
 
 const baseUrl = process.env.BASE_URL;
 
