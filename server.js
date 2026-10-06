@@ -1,3 +1,28 @@
+/**
+ * ============================================================
+ * UN CARTABLE, UN AVENIR — SERVEUR
+ * ============================================================
+ *
+ * Stack :
+ * - Node.js
+ * - Express
+ * - Helmet
+ * - Morgan
+ * - Express Rate Limit
+ * - PayTech
+ *
+ * Fonctionnalités :
+ * - Serveur web
+ * - Paiement PayTech
+ * - IPN PayTech
+ * - Vérification du statut d'un paiement
+ * - Enregistrement des dons
+ * - Pages succès / annulation
+ * - Protection basique contre les abus
+ *
+ * ============================================================
+ */
+
 require('dotenv').config();
 
 const express = require('express');
@@ -8,229 +33,1075 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
+// ============================================================
+// APPLICATION
+// ============================================================
+
 const app = express();
+
+// ============================================================
+// ENVIRONNEMENT
+// ============================================================
+
 const PORT = process.env.PORT || 3000;
+
 const isProduction = process.env.NODE_ENV === 'production';
+
 const baseUrl = process.env.BASE_URL;
-if (isProduction ) throw new Error('BASE_URL doit être définie en production.');
-const BASE_URL = baseUrl.replace(/\/$/, '');
-const PAYTECH_URL = 'https://paytech.sn/api/payment/request-payment';
-const PAYTECH_STATUS_URL = 'https://paytech.sn/api/payment/get-status';
-const DATA_FILE = path.join(__dirname, 'data', 'donations.json');
+
+// En production, BASE_URL est obligatoire
+if (isProduction && !baseUrl) {
+  throw new Error(
+    'BASE_URL doit être définie en production.'
+  );
+}
+
+// En local, on utilise automatiquement localhost
+const BASE_URL = (
+  baseUrl || `http://localhost:${PORT}`
+).replace(/\/$/, '');
+
+// ============================================================
+// PAYTECH
+// ============================================================
+
+const PAYTECH_URL =
+  'https://paytech.sn/api/payment/request-payment';
+
+const PAYTECH_STATUS_URL =
+  'https://paytech.sn/api/payment/get-status';
+
+// ============================================================
+// FICHIERS
+// ============================================================
+
+const DATA_DIR = path.join(__dirname, 'data');
+
+const DATA_FILE = path.join(
+  DATA_DIR,
+  'donations.json'
+);
+
+// Créer le dossier data s'il n'existe pas
+if (!fs.existsSync(DATA_DIR)) {
+  fs.mkdirSync(DATA_DIR, {
+    recursive: true
+  });
+}
+
+// Créer donations.json s'il n'existe pas
+if (!fs.existsSync(DATA_FILE)) {
+  fs.writeFileSync(
+    DATA_FILE,
+    JSON.stringify([], null, 2),
+    'utf8'
+  );
+}
+
+// ============================================================
+// CONFIGURATION EXPRESS
+// ============================================================
 
 app.set('trust proxy', 1);
-app.use(helmet({ contentSecurityPolicy: false }));
+
+// ============================================================
+// HELMET
+// ============================================================
+
+app.use(
+  helmet({
+    contentSecurityPolicy: false
+  })
+);
+
+// ============================================================
+// LOGS
+// ============================================================
+
 app.use(morgan('combined'));
-app.use(express.json({ limit: '100kb' }));
-app.use(express.urlencoded({ extended: true, limit: '100kb' }));
-app.use(express.static(path.join(__dirname, 'public')));
+
+// ============================================================
+// BODY PARSER
+// ============================================================
+
+app.use(
+  express.json({
+    limit: '100kb'
+  })
+);
+
+app.use(
+  express.urlencoded({
+    extended: true,
+    limit: '100kb'
+  })
+);
+
+// ============================================================
+// FICHIERS STATIQUES
+// ============================================================
+
+app.use(
+  express.static(
+    path.join(__dirname, 'public')
+  )
+);
+
+// ============================================================
+// RATE LIMIT — PAIEMENTS
+// ============================================================
 
 const paymentLimiter = rateLimit({
   windowMs: 10 * 60 * 1000,
+
   limit: 20,
+
   standardHeaders: 'draft-8',
+
   legacyHeaders: false,
-  message: { success: 0, message: 'Trop de demandes. Veuillez réessayer dans quelques minutes.' }
+
+  message: {
+    success: 0,
+    message:
+      'Trop de demandes. Veuillez réessayer dans quelques minutes.'
+  }
 });
+
+// ============================================================
+// OUTILS — DONATIONS
+// ============================================================
 
 function readDonations() {
   try {
-    return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-  } catch {
+    const content = fs.readFileSync(
+      DATA_FILE,
+      'utf8'
+    );
+
+    return JSON.parse(content);
+  } catch (error) {
+    console.error(
+      'Erreur lecture donations.json:',
+      error.message
+    );
+
     return [];
   }
 }
 
+// ============================================================
+
 function writeDonations(items) {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(items, null, 2), 'utf8');
+  try {
+    fs.writeFileSync(
+      DATA_FILE,
+      JSON.stringify(items, null, 2),
+      'utf8'
+    );
+
+    return true;
+  } catch (error) {
+    console.error(
+      'Erreur écriture donations.json:',
+      error.message
+    );
+
+    return false;
+  }
 }
+
+// ============================================================
 
 function addDonation(record) {
   const items = readDonations();
+
   items.push(record);
-  writeDonations(items);
+
+  return writeDonations(items);
 }
+
+// ============================================================
 
 function updateDonation(ref, patch) {
   const items = readDonations();
-  const index = items.findIndex(x => x.ref_command === ref);
-  if (index === -1) return false;
-  items[index] = { ...items[index], ...patch, updated_at: new Date().toISOString() };
-  writeDonations(items);
-  return true;
+
+  const index = items.findIndex(
+    x => x.ref_command === ref
+  );
+
+  if (index === -1) {
+    return false;
+  }
+
+  items[index] = {
+    ...items[index],
+    ...patch,
+    updated_at: new Date().toISOString()
+  };
+
+  return writeDonations(items);
 }
+
+// ============================================================
+// SÉCURITÉ — COMPARAISON CONSTANTE
+// ============================================================
 
 function safeEqual(a, b) {
-  if (!a || !b) return false;
+  if (!a || !b) {
+    return false;
+  }
+
   const aa = Buffer.from(String(a));
+
   const bb = Buffer.from(String(b));
-  return aa.length === bb.length && crypto.timingSafeEqual(aa, bb);
+
+  return (
+    aa.length === bb.length &&
+    crypto.timingSafeEqual(aa, bb)
+  );
 }
+
+// ============================================================
+// VÉRIFICATION IPN PAYTECH
+// ============================================================
 
 function verifyPaytechIPN(body) {
-  const apiKey = process.env.PAYTECH_API_KEY;
-  const apiSecret = process.env.PAYTECH_API_SECRET;
-  if (!apiKey || !apiSecret) return false;
+  const apiKey =
+    process.env.PAYTECH_API_KEY;
 
-  const itemPrice = body.final_item_price ?? body.item_price;
-  const ref = body.ref_command;
-  const receivedHmac = body.hmac_compute;
+  const apiSecret =
+    process.env.PAYTECH_API_SECRET;
 
-  if (receivedHmac && itemPrice != null && ref) {
-    const message = `${itemPrice}|${ref}|${apiKey}`;
-    const expected = crypto.createHmac('sha256', apiSecret).update(message).digest('hex');
-    return safeEqual(expected, receivedHmac);
+  if (!apiKey || !apiSecret) {
+    console.error(
+      'PayTech API_KEY ou API_SECRET manquant.'
+    );
+
+    return false;
   }
 
-  const expectedKeyHash = crypto.createHash('sha256').update(apiKey).digest('hex');
-  const expectedSecretHash = crypto.createHash('sha256').update(apiSecret).digest('hex');
-  return safeEqual(expectedKeyHash, body.api_key_sha256) && safeEqual(expectedSecretHash, body.api_secret_sha256);
+  const itemPrice =
+    body.final_item_price ??
+    body.item_price;
+
+  const ref =
+    body.ref_command;
+
+  const receivedHmac =
+    body.hmac_compute;
+
+  // ----------------------------------------------------------
+  // Méthode HMAC
+  // ----------------------------------------------------------
+
+  if (
+    receivedHmac &&
+    itemPrice != null &&
+    ref
+  ) {
+    const message =
+      `${itemPrice}|${ref}|${apiKey}`;
+
+    const expected =
+      crypto
+        .createHmac(
+          'sha256',
+          apiSecret
+        )
+        .update(message)
+        .digest('hex');
+
+    return safeEqual(
+      expected,
+      receivedHmac
+    );
+  }
+
+  // ----------------------------------------------------------
+  // Méthode hash API KEY / SECRET
+  // ----------------------------------------------------------
+
+  const expectedKeyHash =
+    crypto
+      .createHash('sha256')
+      .update(apiKey)
+      .digest('hex');
+
+  const expectedSecretHash =
+    crypto
+      .createHash('sha256')
+      .update(apiSecret)
+      .digest('hex');
+
+  return (
+    safeEqual(
+      expectedKeyHash,
+      body.api_key_sha256
+    ) &&
+    safeEqual(
+      expectedSecretHash,
+      body.api_secret_sha256
+    )
+  );
 }
+
+// ============================================================
+// DÉCODAGE CUSTOM FIELD
+// ============================================================
 
 function decodeCustomField(value) {
-  if (!value) return {};
+  if (!value) {
+    return {};
+  }
+
   try {
-    return JSON.parse(Buffer.from(value, 'base64').toString('utf8'));
-  } catch {
-    try { return JSON.parse(value); } catch { return {}; }
+    return JSON.parse(
+      Buffer
+        .from(value, 'base64')
+        .toString('utf8')
+    );
+  } catch (error) {
+    try {
+      return JSON.parse(value);
+    } catch (error2) {
+      return {};
+    }
   }
 }
 
-app.get('/api/health', (req, res) => {
-  res.json({ success: 1, service: 'un-cartable-un-avenir', paytechConfigured: Boolean(process.env.PAYTECH_API_KEY && process.env.PAYTECH_API_SECRET), env: process.env.PAYTECH_ENV || 'prod' });
-});
+// ============================================================
+// ROUTE — HEALTH CHECK
+// ============================================================
 
-app.post('/api/paytech/create-payment', paymentLimiter, async (req, res) => {
-  try {
-    const amount = Number(req.body.amount);
-    const name = String(req.body.name || '').trim().slice(0, 120);
-    const email = String(req.body.email || '').trim().slice(0, 160);
+app.get(
+  '/api/health',
+  (req, res) => {
 
-    if (!Number.isInteger(amount) || amount < 100 || amount > 50000000) {
-      return res.status(400).json({ success: 0, message: 'Le montant doit être un nombre entier compris entre 100 et 50 000 000 FCFA.' });
-    }
-    if (email && !/^\S+@\S+\.\S+$/.test(email)) {
-      return res.status(400).json({ success: 0, message: 'Adresse email invalide.' });
-    }
-    if (!process.env.PAYTECH_API_KEY || !process.env.PAYTECH_API_SECRET) {
-      return res.status(503).json({ success: 0, message: 'PayTech n’est pas encore configuré sur le serveur. Ajoutez les clés dans .env.' });
-    }
+    const paytechConfigured =
+      Boolean(
+        process.env.PAYTECH_API_KEY &&
+        process.env.PAYTECH_API_SECRET
+      );
 
-    const ref = `CPT-${Date.now()}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
-    const customField = Buffer.from(JSON.stringify({ campaign: 'Un Cartable, Un Avenir', donor_name: name, donor_email: email, ref_command: ref })).toString('base64');
+    res.json({
+      success: 1,
 
-    const payload = {
-      item_name: 'Don — Un Cartable, Un Avenir',
-      item_price: amount,
-      currency: 'XOF',
-      ref_command: ref,
-      command_name: `Soutien campagne Un Cartable, Un Avenir — ${ref}`,
-      env: process.env.PAYTECH_ENV || 'test',
-      ipn_url: `${BASE_URL}/api/paytech/ipn`,
-      success_url: `${BASE_URL}/paiement/succes`,
-      cancel_url: `${BASE_URL}/paiement/annule`,
-      custom_field: customField
-    };
+      service:
+        'un-cartable-un-avenir',
 
-    const response = await fetch(PAYTECH_URL, {
-      method: 'POST',
-      headers: {
-        Accept: 'application/json',
-        'Content-Type': 'application/json',
-        API_KEY: process.env.PAYTECH_API_KEY,
-        API_SECRET: process.env.PAYTECH_API_SECRET
-      },
-      body: JSON.stringify(payload)
+      status:
+        'online',
+
+      environment:
+        process.env.NODE_ENV || 'development',
+
+      paytechEnvironment:
+        process.env.PAYTECH_ENV || 'test',
+
+      paytechConfigured,
+
+      baseUrl:
+        BASE_URL,
+
+      timestamp:
+        new Date().toISOString()
     });
-
-    const data = await response.json().catch(() => ({}));
-
-    if (!response.ok || Number(data.success) !== 1 || !(data.redirect_url || data.redirectUrl)) {
-      console.error('PayTech create-payment error:', data);
-      return res.status(502).json({ success: 0, message: data.message || 'PayTech n’a pas pu créer le paiement.' });
-    }
-
-    const redirectUrl = data.redirect_url || data.redirectUrl;
-    addDonation({
-      ref_command: ref,
-      token: data.token || null,
-      amount,
-      currency: 'XOF',
-      donor_name: name,
-      donor_email: email,
-      status: 'pending',
-      env: process.env.PAYTECH_ENV || 'test',
-      created_at: new Date().toISOString()
-    });
-
-    return res.json({ success: 1, redirect_url: redirectUrl, token: data.token || null, reference: ref });
-  } catch (error) {
-    console.error('create-payment:', error.message);
-    return res.status(500).json({ success: 0, message: 'Erreur interne lors de la création du paiement.' });
   }
-});
+);
 
-app.post('/api/paytech/ipn', (req, res) => {
-  try {
-    if (!verifyPaytechIPN(req.body)) return res.status(403).send('Forbidden');
+// ============================================================
+// ROUTE — CRÉATION PAIEMENT PAYTECH
+// ============================================================
 
-    const body = req.body;
-    const ref = body.ref_command;
-    const type = body.type_event;
-    const custom = decodeCustomField(body.custom_field);
-    const finalAmount = Number(body.final_item_price ?? body.item_price ?? 0);
+app.post(
+  '/api/paytech/create-payment',
+  paymentLimiter,
+  async (req, res) => {
 
-    if (!ref) return res.status(400).send('Missing ref_command');
+    try {
 
-    if (type === 'sale_complete') {
-      updateDonation(ref, {
-        status: 'paid',
-        paid_at: new Date().toISOString(),
-        payment_method: body.payment_method || null,
-        client_phone: body.client_phone || null,
-        final_amount: finalAmount,
-        token: body.token || null,
-        custom: custom
+      // --------------------------------------------------------
+      // DONNÉES
+      // --------------------------------------------------------
+
+      const amount =
+        Number(req.body.amount);
+
+      const name =
+        String(
+          req.body.name || ''
+        )
+          .trim()
+          .slice(0, 120);
+
+      const email =
+        String(
+          req.body.email || ''
+        )
+          .trim()
+          .slice(0, 160);
+
+      // --------------------------------------------------------
+      // VALIDATION MONTANT
+      // --------------------------------------------------------
+
+      if (
+        !Number.isInteger(amount) ||
+        amount < 100 ||
+        amount > 50000000
+      ) {
+        return res.status(400).json({
+          success: 0,
+
+          message:
+            'Le montant doit être un nombre entier compris entre 100 et 50 000 000 FCFA.'
+        });
+      }
+
+      // --------------------------------------------------------
+      // VALIDATION EMAIL
+      // --------------------------------------------------------
+
+      if (
+        email &&
+        !/^\S+@\S+\.\S+$/.test(email)
+      ) {
+        return res.status(400).json({
+          success: 0,
+
+          message:
+            'Adresse email invalide.'
+        });
+      }
+
+      // --------------------------------------------------------
+      // VÉRIFICATION PAYTECH
+      // --------------------------------------------------------
+
+      if (
+        !process.env.PAYTECH_API_KEY ||
+        !process.env.PAYTECH_API_SECRET
+      ) {
+
+        return res.status(503).json({
+
+          success: 0,
+
+          message:
+            'PayTech n’est pas encore configuré sur le serveur. Ajoutez les clés dans les variables d’environnement.'
+        });
+      }
+
+      // --------------------------------------------------------
+      // RÉFÉRENCE
+      // --------------------------------------------------------
+
+      const ref =
+        `CPT-${Date.now()}-${crypto
+          .randomBytes(3)
+          .toString('hex')
+          .toUpperCase()}`;
+
+      // --------------------------------------------------------
+      // CUSTOM FIELD
+      // --------------------------------------------------------
+
+      const customField =
+        Buffer
+          .from(
+            JSON.stringify({
+              campaign:
+                'Un Cartable, Un Avenir',
+
+              donor_name:
+                name,
+
+              donor_email:
+                email,
+
+              ref_command:
+                ref
+            })
+          )
+          .toString('base64');
+
+      // --------------------------------------------------------
+      // PAYLOAD PAYTECH
+      // --------------------------------------------------------
+
+      const payload = {
+
+        item_name:
+          'Don — Un Cartable, Un Avenir',
+
+        item_price:
+          amount,
+
+        currency:
+          'XOF',
+
+        ref_command:
+          ref,
+
+        command_name:
+          `Soutien campagne Un Cartable, Un Avenir — ${ref}`,
+
+        env:
+          process.env.PAYTECH_ENV || 'test',
+
+        ipn_url:
+          `${BASE_URL}/api/paytech/ipn`,
+
+        success_url:
+          `${BASE_URL}/paiement/succes`,
+
+        cancel_url:
+          `${BASE_URL}/paiement/annule`,
+
+        custom_field:
+          customField
+      };
+
+      // --------------------------------------------------------
+      // APPEL PAYTECH
+      // --------------------------------------------------------
+
+      const response =
+        await fetch(
+          PAYTECH_URL,
+          {
+            method: 'POST',
+
+            headers: {
+              Accept:
+                'application/json',
+
+              'Content-Type':
+                'application/json',
+
+              API_KEY:
+                process.env.PAYTECH_API_KEY,
+
+              API_SECRET:
+                process.env.PAYTECH_API_SECRET
+            },
+
+            body:
+              JSON.stringify(payload)
+          }
+        );
+
+      // --------------------------------------------------------
+      // RÉPONSE
+      // --------------------------------------------------------
+
+      const data =
+        await response
+          .json()
+          .catch(() => ({}));
+
+      // --------------------------------------------------------
+      // ERREUR PAYTECH
+      // --------------------------------------------------------
+
+      if (
+        !response.ok ||
+        Number(data.success) !== 1 ||
+        !(data.redirect_url || data.redirectUrl)
+      ) {
+
+        console.error(
+          'PayTech create-payment error:',
+          data
+        );
+
+        return res.status(502).json({
+
+          success: 0,
+
+          message:
+            data.message ||
+            'PayTech n’a pas pu créer le paiement.'
+        });
+      }
+
+      // --------------------------------------------------------
+      // URL REDIRECTION
+      // --------------------------------------------------------
+
+      const redirectUrl =
+        data.redirect_url ||
+        data.redirectUrl;
+
+      // --------------------------------------------------------
+      // ENREGISTREMENT DON
+      // --------------------------------------------------------
+
+      addDonation({
+
+        ref_command:
+          ref,
+
+        token:
+          data.token || null,
+
+        amount,
+
+        currency:
+          'XOF',
+
+        donor_name:
+          name,
+
+        donor_email:
+          email,
+
+        status:
+          'pending',
+
+        env:
+          process.env.PAYTECH_ENV || 'test',
+
+        created_at:
+          new Date().toISOString()
       });
-    } else if (type === 'sale_canceled') {
-      updateDonation(ref, {
-        status: 'canceled',
-        canceled_at: new Date().toISOString(),
-        payment_method: body.payment_method || null,
-        token: body.token || null
+
+      // --------------------------------------------------------
+      // RÉPONSE FRONTEND
+      // --------------------------------------------------------
+
+      return res.json({
+
+        success: 1,
+
+        redirect_url:
+          redirectUrl,
+
+        token:
+          data.token || null,
+
+        reference:
+          ref
+      });
+
+    } catch (error) {
+
+      console.error(
+        'create-payment:',
+        error.message
+      );
+
+      return res.status(500).json({
+
+        success: 0,
+
+        message:
+          'Erreur interne lors de la création du paiement.'
       });
     }
-
-    return res.status(200).send('IPN OK');
-  } catch (error) {
-    console.error('IPN:', error.message);
-    return res.status(500).send('IPN ERROR');
   }
-});
+);
 
-app.get('/api/paytech/status/:token', paymentLimiter, async (req, res) => {
-  try {
-    if (!process.env.PAYTECH_API_KEY || !process.env.PAYTECH_API_SECRET) return res.status(503).json({ success: 0, message: 'PayTech non configuré.' });
-    const token = String(req.params.token || '').replace(/[^a-zA-Z0-9_-]/g, '');
-    if (!token) return res.status(400).json({ success: 0, message: 'Token invalide.' });
+// ============================================================
+// ROUTE — IPN PAYTECH
+// ============================================================
 
-    const response = await fetch(`${PAYTECH_STATUS_URL}?token_payment=${encodeURIComponent(token)}`, {
-      headers: { Accept: 'application/json', API_KEY: process.env.PAYTECH_API_KEY, API_SECRET: process.env.PAYTECH_API_SECRET }
+app.post(
+  '/api/paytech/ipn',
+  (req, res) => {
+
+    try {
+
+      // --------------------------------------------------------
+      // VÉRIFICATION
+      // --------------------------------------------------------
+
+      if (
+        !verifyPaytechIPN(req.body)
+      ) {
+
+        console.error(
+          'IPN PayTech rejetée : signature invalide.'
+        );
+
+        return res
+          .status(403)
+          .send('Forbidden');
+      }
+
+      const body =
+        req.body;
+
+      const ref =
+        body.ref_command;
+
+      const type =
+        body.type_event;
+
+      const custom =
+        decodeCustomField(
+          body.custom_field
+        );
+
+      const finalAmount =
+        Number(
+          body.final_item_price ??
+          body.item_price ??
+          0
+        );
+
+      // --------------------------------------------------------
+      // RÉFÉRENCE
+      // --------------------------------------------------------
+
+      if (!ref) {
+
+        return res
+          .status(400)
+          .send('Missing ref_command');
+      }
+
+      // --------------------------------------------------------
+      // PAIEMENT RÉUSSI
+      // --------------------------------------------------------
+
+      if (
+        type === 'sale_complete'
+      ) {
+
+        updateDonation(
+          ref,
+          {
+
+            status:
+              'paid',
+
+            paid_at:
+              new Date().toISOString(),
+
+            payment_method:
+              body.payment_method ||
+              null,
+
+            client_phone:
+              body.client_phone ||
+              null,
+
+            final_amount:
+              finalAmount,
+
+            token:
+              body.token ||
+              null,
+
+            custom:
+              custom
+          }
+        );
+      }
+
+      // --------------------------------------------------------
+      // PAIEMENT ANNULÉ
+      // --------------------------------------------------------
+
+      else if (
+        type === 'sale_canceled'
+      ) {
+
+        updateDonation(
+          ref,
+          {
+
+            status:
+              'canceled',
+
+            canceled_at:
+              new Date().toISOString(),
+
+            payment_method:
+              body.payment_method ||
+              null,
+
+            token:
+              body.token ||
+              null
+          }
+        );
+      }
+
+      // --------------------------------------------------------
+      // RÉPONSE
+      // --------------------------------------------------------
+
+      return res
+        .status(200)
+        .send('IPN OK');
+
+    } catch (error) {
+
+      console.error(
+        'IPN:',
+        error.message
+      );
+
+      return res
+        .status(500)
+        .send('IPN ERROR');
+    }
+  }
+);
+
+// ============================================================
+// ROUTE — STATUT PAIEMENT
+// ============================================================
+
+app.get(
+  '/api/paytech/status/:token',
+  paymentLimiter,
+  async (req, res) => {
+
+    try {
+
+      // --------------------------------------------------------
+      // CONFIGURATION
+      // --------------------------------------------------------
+
+      if (
+        !process.env.PAYTECH_API_KEY ||
+        !process.env.PAYTECH_API_SECRET
+      ) {
+
+        return res.status(503).json({
+
+          success: 0,
+
+          message:
+            'PayTech non configuré.'
+        });
+      }
+
+      // --------------------------------------------------------
+      // TOKEN
+      // --------------------------------------------------------
+
+      const token =
+        String(
+          req.params.token || ''
+        )
+          .replace(
+            /[^a-zA-Z0-9_-]/g,
+            ''
+          );
+
+      if (!token) {
+
+        return res.status(400).json({
+
+          success: 0,
+
+          message:
+            'Token invalide.'
+        });
+      }
+
+      // --------------------------------------------------------
+      // REQUÊTE PAYTECH
+      // --------------------------------------------------------
+
+      const response =
+        await fetch(
+          `${PAYTECH_STATUS_URL}?token_payment=${encodeURIComponent(token)}`,
+          {
+
+            headers: {
+
+              Accept:
+                'application/json',
+
+              API_KEY:
+                process.env.PAYTECH_API_KEY,
+
+              API_SECRET:
+                process.env.PAYTECH_API_SECRET
+            }
+          }
+        );
+
+      // --------------------------------------------------------
+      // RÉPONSE
+      // --------------------------------------------------------
+
+      const data =
+        await response
+          .json()
+          .catch(() => ({}));
+
+      return res
+        .status(
+          response.ok
+            ? 200
+            : 502
+        )
+        .json(data);
+
+    } catch (error) {
+
+      console.error(
+        'PayTech status:',
+        error.message
+      );
+
+      return res.status(500).json({
+
+        success: 0,
+
+        message:
+          'Impossible de vérifier le statut.'
+      });
+    }
+  }
+);
+
+// ============================================================
+// PAGE — PAIEMENT RÉUSSI
+// ============================================================
+
+app.get(
+  '/paiement/succes',
+  (req, res) => {
+
+    res.sendFile(
+      path.join(
+        __dirname,
+        'public',
+        'success.html'
+      )
+    );
+  }
+);
+
+// ============================================================
+// PAGE — PAIEMENT ANNULÉ
+// ============================================================
+
+app.get(
+  '/paiement/annule',
+  (req, res) => {
+
+    res.sendFile(
+      path.join(
+        __dirname,
+        'public',
+        'cancel.html'
+      )
+    );
+  }
+);
+
+// ============================================================
+// 404
+// ============================================================
+
+app.use(
+  (req, res) => {
+
+    res
+      .status(404)
+      .sendFile(
+        path.join(
+          __dirname,
+          'public',
+          '404.html'
+        )
+      );
+  }
+);
+
+// ============================================================
+// GESTIONNAIRE D'ERREURS
+// ============================================================
+
+app.use(
+  (error, req, res, next) => {
+
+    console.error(
+      'Server error:',
+      error
+    );
+
+    if (res.headersSent) {
+      return next(error);
+    }
+
+    return res.status(500).json({
+
+      success: 0,
+
+      message:
+        'Une erreur interne est survenue.'
     });
-    const data = await response.json().catch(() => ({}));
-    return res.status(response.ok ? 200 : 502).json(data);
-  } catch (error) {
-    return res.status(500).json({ success: 0, message: 'Impossible de vérifier le statut.' });
   }
-});
+);
 
-app.get('/paiement/succes', (req, res) => res.sendFile(path.join(__dirname, 'public', 'success.html')));
-app.get('/paiement/annule', (req, res) => res.sendFile(path.join(__dirname, 'public', 'cancel.html')));
+// ============================================================
+// DÉMARRAGE SERVEUR
+// ============================================================
 
-app.use((req, res) => res.status(404).sendFile(path.join(__dirname, 'public', '404.html')));
+app.listen(
+  PORT,
+  '0.0.0.0',
+  () => {
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`\n✓ Un Cartable, Un Avenir: ${BASE_URL}`);
-  console.log(`✓ PayTech environment: ${process.env.PAYTECH_ENV || 'test'}`);
-  console.log(`✓ API health: ${BASE_URL}/api/health\n`);
-});
+    console.log('');
+    console.log(
+      '================================================'
+    );
+    console.log(
+      '  UN CARTABLE, UN AVENIR'
+    );
+    console.log(
+      '================================================'
+    );
+
+    console.log(
+      `✓ Serveur démarré sur le port ${PORT}`
+    );
+
+    console.log(
+      `✓ BASE_URL : ${BASE_URL}`
+    );
+
+    console.log(
+      `✓ Environnement Node : ${
+        process.env.NODE_ENV ||
+        'development'
+      }`
+    );
+
+    console.log(
+      `✓ PayTech : ${
+        process.env.PAYTECH_ENV ||
+        'test'
+      }`
+    );
+
+    console.log(
+      `✓ PayTech configuré : ${
+        Boolean(
+          process.env.PAYTECH_API_KEY &&
+          process.env.PAYTECH_API_SECRET
+        )
+      }`
+    );
+
+    console.log(
+      `✓ Health : ${BASE_URL}/api/health`
+    );
+
+    console.log(
+      '================================================'
+    );
+
+    console.log('');
+  }
+);
